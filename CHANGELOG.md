@@ -8,6 +8,108 @@ when the repo grows.
 This file complements `git log`: commits explain mechanics, this file
 explains intent.
 
+## [0.9.0] — 2026-07-08
+
+Release theme: **Watcher consolidation + daemon resource-leak fixes — single OS autostart, multi-root registry**.
+
+### Added
+
+**`code-memory watchd` — single long-lived multi-root watch daemon.** Replaces the
+per-repo OS autostart units (one launchd job per repo on macOS, one systemd unit
+per repo on Linux, etc.) with a single always-on daemon that watches all registered
+repos in one process. `watchd --status` reports the daemon's PID and all watched roots.
+
+**Watch registry at `~/.config/code-memory/watch-registry.json`.** Maps project path
+to slug for the daemon to discover and watch all registered repos. Registry supports
+atomic writes and advisory file locking; the daemon live-reconciles as repos are
+added/removed via `ensure_autostart`, so no manual daemon restart is needed.
+
+**`code-memory autostart migrate` command.** Consolidates legacy per-repo autostart
+units (launchd jobs, systemd units, schtasks entries) into the single `watchd` daemon.
+The migration seeds the watch registry from existing roots, verifies the daemon covers
+all registered projects, and only then removes the old per-repo units — guarantees
+no repo is left unwatched. Supports `--dry-run` to preview changes.
+
+Reason: reduce macOS login-item clutter from N watcher jobs to one, prevent systemd
+unit explosion on Linux servers, and guarantee zero memory/FD growth in the always-on
+daemon by centralizing resource lifecycle.
+
+### Changed
+
+**Autostart now installs ONE fixed unit instead of N (one per repo).** On macOS,
+the legacy login item per repo (`com.codememory.watch.<slug>`) collapses to one
+fixed entry (`com.codememory.watchd`); on Linux, one systemd user unit
+(`codememory-watchd.service`) replaces `codememory-watch-<slug>.service` instances;
+on Windows, one schtasks entry (`CodeMemory\Watchd`) replaces per-project entries.
+`ensure_autostart` now registers repos into the watch registry and ensures the single
+daemon is running; a legacy per-repo-unit sweep is retained for one to two releases
+to clean up old entries.
+
+**MCP server boot now registers the active repo with the daemon and starts an
+in-process fallback watcher only when the daemon does not already cover that repo.**
+Prevents double-syncing (daemon + in-process watcher both queuing the same ingest)
+and reduces startup noise in logs.
+
+Reason: simplify the autostart surface (one fixed entry per machine instead of
+scaling with repo count) and prevent index double-writes.
+
+### Fixed
+
+**Eliminated per-sync resource leaks in the long-lived daemon.** The daemon now
+holds Qdrant and FalkorDB clients as process-singletons instead of creating fresh
+connections per sync; `Pipeline` is a context manager and its sqlite connections
+(episodic metadata + ingest state) are opened and closed per `sync_repo` call,
+fixing both a connection leak and a silent cross-thread `sqlite3.ProgrammingError`
+that would fail every ingest after the first in daemon mode; the full-ingest thread
+pool is always shut down via try/finally (previously leaked threads on exception);
+embedder initialization is now lock-guarded against a cold-start race; and
+same-project syncs are serialized via single-flight to prevent concurrent ingests
+of the same repo.
+
+Reason: the daemon runs 24/7 — any leak (open file descriptor, unclosed connection,
+spawned thread) accumulates until the machine runs out of resources. This fix is
+critical for production use.
+
+## [0.8.0] — 2026-07-07
+
+Release theme: **Gemma removed — claims are now agent-authored via `codememory_assert_claim` only**.
+
+### Removed
+
+**Gemma2:9b LLM dependency removed entirely.** The `ClaimExtractor` class, the
+`code-memory extract-claims` CLI command, and the `codememory_extract_claims` MCP
+tool are all gone. No local Ollama model is required for claim extraction
+anymore.
+
+**OpenCode plugin no longer auto-fires `extractClaimsDetached`** on session idle.
+The Claude Code plugin was already clean.
+
+**Installers no longer pull gemma2:9b.** `install.sh`, `scripts/install.sh`, and
+`.env.example` have been updated to reflect the agent-authored approach.
+
+### Changed
+
+**Claims are now agent-authored exclusively.** The `codememory_assert_claim` MCP
+tool is the sole claim creation path. Plugins detect durable user assertions via
+regex heuristic (claim-intent) and nudge the agent to call the tool — no LLM is
+in the loop at any point. This eliminates a ~5.4 GB model download and ~30s
+inference latency per session.
+
+**Config defaults updated.** `CLAIMS_EXTRACTION` flag still exists but gates only
+claim storage (it no longer controls LLM model invocation). `CLAIMS_LLM_MODEL`
+env var removed.
+
+**Update plan no longer checks for gemma2:9b** in `code-memory update` component
+listing. Only `bge-m3` is tracked as the Ollama model dependency.
+
+**Documentation updated.** README, install scripts, plugin SKILL.md, and
+`.env.example` all reflect the gemma-free, agent-authored claim workflow.
+
+Reason: gemma2:9b auto-extraction produced noisy/empty triples on most prompts
+and the agent-powered `codememory_assert_claim` path (regex claim-intent +
+agent-authored triples) provides higher-quality claims with zero model
+dependency.
+
 ## [0.7.6] — 2026-06-21
 
 Release theme: **Correct tree-sitter pin + Windows console & extras fixes**.

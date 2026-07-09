@@ -7,9 +7,9 @@
   infra files into $HOME\.code-memory\, starts FalkorDB + Qdrant on any
   working docker engine — native (Docker Desktop, ...) or docker-ce inside
   WSL2 via `wsl -e docker`, offering to provision the latter when nothing
-  is found (Docker Desktop NOT required) — pulls the bge-m3 embedding model
-  (and optionally gemma2:9b for claim extraction), and wires up the Claude
-  Code plugin + MCP server. Optionally installs the OpenCode plugin from npm.
+  is found (Docker Desktop NOT required) — pulls the bge-m3 embedding model,
+  and wires up the Claude Code plugin + MCP server. Optionally installs the
+  OpenCode plugin from npm.
 
   Interactive by default. Pass -Yes to accept defaults; pass any -No*
   switch to skip a step; pass -NonInteractive to refuse all prompts.
@@ -21,7 +21,7 @@
   `scripts/install.ps1` instead.
 
 .PARAMETER Yes
-  Accept default for every prompt (Claude=Y, OpenCode=N, claims=N).
+  Accept default for every prompt (Claude=Y, OpenCode=N).
 
 .PARAMETER NonInteractive
   Refuse all prompts; use defaults (same as -Yes but without confirmation).
@@ -41,12 +41,6 @@
 .PARAMETER NoMcp
   Skip MCP server registration with Claude Code.
 
-.PARAMETER NoClaims
-  Skip pulling gemma2:9b for claim extraction.
-
-.PARAMETER WithClaims
-  Force-pull gemma2:9b without prompting.
-
 .EXAMPLE
   irm https://raw.githubusercontent.com/fmflurry/code-memory/main/install.ps1 | iex
 
@@ -64,9 +58,7 @@ param(
   [switch]$NoOllama,
   [switch]$NoClaude,
   [switch]$NoOpencode,
-  [switch]$NoMcp,
-  [switch]$NoClaims,
-  [switch]$WithClaims
+  [switch]$NoMcp
 )
 
 $ErrorActionPreference = 'Stop'
@@ -438,22 +430,7 @@ if ($doOllama) {
       if ($LASTEXITCODE -eq 0) { Ok "bge-m3 pulled" } else { Warn "ollama pull bge-m3 returned exit $LASTEXITCODE" }
     }
 
-    # optional gemma2:9b for claim extraction
-    $doClaims = $false
-    if ($WithClaims) {
-      $doClaims = $true
-    } elseif (-not $NoClaims) {
-      $doClaims = Ask-YesNo "Also pull gemma2:9b for user-claim extraction (~5.4 GB)?" "N"
-    }
-    if ($doClaims) {
-      $models2 = (& ollama list 2>$null) -join "`n"
-      if ($models2 -match '(?m)^gemma2:9b\s') {
-        Ok "gemma2:9b already present"
-      } else {
-        & ollama pull gemma2:9b
-        if ($LASTEXITCODE -eq 0) { Ok "gemma2:9b pulled" } else { Warn "ollama pull gemma2:9b returned exit $LASTEXITCODE" }
-      }
-    }
+
   } else {
     Warn "ollama step skipped"
   }

@@ -286,4 +286,4 @@ async function createMemoryClient(opts = {}) {
   };
 }
 
-module.exports = { createMemoryClient };
+module.exports = { createMemoryClient, _windowlessPythonw };

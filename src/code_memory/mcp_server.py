@@ -15,9 +15,8 @@ Tools:
   - codememory_assembly_members(type, assembly?, project?) — .NET DLL surface
   - codememory_drift(head_sha, project?)                   — temporal
   - codememory_at_sha(sha, sha_ord, label?, limit?, project?)
-  - codememory_callers_at_sha(symbol, sha, sha_ord, project?)
-  - codememory_extract_claims(prompts, project, session_id?) — Graphiti-style
-  - codememory_assert_claim(subject, predicate, object, project, ...) —
+   - codememory_callers_at_sha(symbol, sha, sha_ord, project?)
+   - codememory_assert_claim(subject, predicate, object, project, ...) —
     agent-authored direct claim (no LLM)
   - codememory_claims(subject?, as_of?, project)
 
@@ -27,6 +26,8 @@ Transport: stdio. Register via `code-memory-mcp` script entrypoint.
 from __future__ import annotations
 
 import atexit
+import contextlib
+import io
 import json
 import logging
 import os
@@ -43,7 +44,7 @@ from mcp.types import TextContent, Tool
 
 from dataclasses import asdict
 
-from .config import CONFIG, detect_project_slug
+from .config import CONFIG, detect_project_slug, watchd_state_path
 from .episodic import Episode
 from .graph import FalkorStore
 from .orchestrator import Pipeline, Retriever
@@ -451,39 +452,6 @@ _TOOLS: list[Tool] = [
         },
     ),
     Tool(
-        name="codememory_extract_claims",
-        description=(
-            "Graphiti-style: extract bi-temporal (subject, predicate, object) "
-            "claims from user prompts via a local LLM (gemma2:9b by default) "
-            "and store them with valid_at = prompt timestamp, recorded_at = "
-            "now, head_sha = current HEAD. Single-valued predicates ('uses', "
-            "'prefers', 'deployed-to', ...) close prior conflicting "
-            "assertions. On by default. Set CLAIMS_EXTRACTION=false to "
-            "disable. Fire-and-forget — call from a Stop hook, not inline "
-            "in a turn."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "prompts": {
-                    "type": "array",
-                    "description": (
-                        "List of user prompts to extract from. Each item "
-                        "is either a raw string or "
-                        "{text: string, ts?: number, id?: string}."
-                    ),
-                    "items": {"type": ["string", "object"]},
-                },
-                "session_id": {
-                    "type": "string",
-                    "description": "Originating session for provenance.",
-                },
-                "project": _project_schema(),
-            },
-            "required": ["prompts", "project"],
-        },
-    ),
-    Tool(
         name="codememory_assert_claim",
         description=(
             "Agent-authored direct claim. Use this when YOU (the agent) "
@@ -491,9 +459,7 @@ _TOOLS: list[Tool] = [
             "remembering across sessions: stable preferences, ownership, "
             "tech-stack decisions, rejections, or explicit corrections of "
             "your behavior. NO LLM is invoked — you supply the structured "
-            "triple yourself. Prefer this over codememory_extract_claims "
-            "when the assertion is unambiguous; reserve extract_claims for "
-            "batch processing of multiple prompts.\n\n"
+            "triple yourself.\n\n"
             "Predicate vocab (kebab-case verbs): `uses`, `prefers`, "
             "`rejected`, `wants-to`, `is-located-at`, `depends-on`, "
             "`deployed-to`, `owns`, `is-a`, `mentioned`, `worked-on`. "
@@ -1178,131 +1144,9 @@ def _callers_at_sha(args: dict[str, Any]) -> list[TextContent]:
     )
 
 
-def _extract_claims(args: dict[str, Any]) -> list[TextContent]:
-    """Run claim extraction over user prompts and persist results.
-
-    Fire-and-forget contract from the caller's perspective: we never
-    raise on a malformed prompt or a model glitch. Infra failures
-    (Ollama unreachable) are returned as ``{"error": ...}`` so the
-    hook can log and move on.
-    """
-    project = _require_project(args)
-    if not CONFIG.claims_enabled:
-        return _text(
-            {
-                "status": "disabled",
-                "hint": "set CLAIMS_EXTRACTION=true (if disabled).",
-            }
-        )
-
-    raw_prompts = args.get("prompts") or []
-    if not isinstance(raw_prompts, list):
-        return _text({"error": "ValueError", "message": "`prompts` must be a list."})
-
-    normalized: list[tuple[str, float, str | None]] = []
-    for item in raw_prompts:
-        if isinstance(item, str):
-            text = item.strip()
-            if text:
-                normalized.append((text, _now(), None))
-        elif isinstance(item, dict):
-            text = str(item.get("text") or "").strip()
-            if not text:
-                continue
-            ts = item.get("ts")
-            ts_val = float(ts) if isinstance(ts, (int, float)) else _now()
-            pid = item.get("id")
-            pid_val = str(pid) if isinstance(pid, str) and pid else None
-            normalized.append((text, ts_val, pid_val))
-
-    if not normalized:
-        return _text({"project": project, "claims_added": 0, "claims": []})
-
-    session_id = args.get("session_id")
-    session_val = str(session_id) if isinstance(session_id, str) and session_id else None
-
-    repo = Path(os.environ.get("CODE_MEMORY_REPO") or os.getcwd()).resolve()
-    head_sha = _head_sha_safe(repo)
-
-    from .claims import (
-        ClaimExtractor,
-        ClaimRecord,
-        ClaimsStore,
-        EntityResolver,
-    )
-    from .claims.extractor import ExtractionError
-
-    cfg = CONFIG.for_project(project)
-    store = ClaimsStore(path=cfg.claims_db)
-    extractor = ClaimExtractor()
-    resolver: EntityResolver | None
-    try:
-        resolver = EntityResolver(project=project, cfg=cfg)
-    except Exception:  # noqa: BLE001
-        resolver = None
-    added = 0
-    samples: list[dict[str, Any]] = []
-    try:
-        for text, ts, pid in normalized:
-            try:
-                claims = extractor.extract(text)
-            except ExtractionError as exc:
-                return _text(
-                    {
-                        "project": project,
-                        "error": "ExtractionError",
-                        "message": str(exc),
-                        "claims_added": added,
-                    }
-                )
-            for c in claims:
-                subj_id = _resolve_or_none(resolver, c.subject)
-                obj_id = _resolve_or_none(resolver, c.object)
-                rec = ClaimRecord(
-                    subject=c.subject,
-                    predicate=c.predicate,
-                    object=c.object,
-                    polarity=c.polarity,
-                    confidence=c.confidence,
-                    evidence_span=c.evidence_span,
-                    valid_at=ts,
-                    head_sha=head_sha,
-                    session_id=session_val,
-                    source_prompt_id=pid,
-                    entity_subject_id=subj_id,
-                    entity_object_id=obj_id,
-                )
-                store.upsert(rec)
-                added += 1
-                if len(samples) < 5:
-                    samples.append(
-                        {
-                            "subject": rec.subject,
-                            "predicate": rec.predicate,
-                            "object": rec.object,
-                            "confidence": rec.confidence,
-                        }
-                    )
-    finally:
-        extractor.close()
-        store.close()
-
-    return _text(
-        {
-            "project": project,
-            "claims_added": added,
-            "sample": samples,
-        }
-    )
-
 
 def _assert_claim(args: dict[str, Any]) -> list[TextContent]:
-    """Agent-authored claim. No LLM in the loop.
-
-    Bypasses the ``claims_enabled`` (CLAIMS_EXTRACTION) flag because no
-    Ollama call is made — the agent supplies the triple directly. The
-    flag still gates the extractor path (``_extract_claims``).
-    """
+    """Agent-authored claim. No LLM in the loop."""
     project = _require_project(args)
 
     subject = args.get("subject")
@@ -1706,7 +1550,6 @@ _HANDLERS = {
     "codememory_drift": _drift,
     "codememory_at_sha": _at_sha,
     "codememory_callers_at_sha": _callers_at_sha,
-    "codememory_extract_claims": _extract_claims,
     "codememory_assert_claim": _assert_claim,
     "codememory_claims": _read_claims,
     "codememory_health": _health,
@@ -1808,6 +1651,51 @@ def build_server() -> Server:
     return server
 
 
+def _attempt_autostart_migrate() -> None:
+    """Best-effort opportunistic call into the Phase-4 verified-teardown
+    migration entrypoint (``code_memory.cli.autostart_migrate``).
+
+    That entrypoint seeds the watch registry, installs+starts the single
+    ``watchd`` daemon, VERIFIES coverage, and only then removes legacy
+    per-repo units -- this helper does not reimplement any of that; it
+    only invokes it and swallows failures so a broken migration never
+    blocks MCP server boot.
+
+    stdio safety: the MCP server speaks JSON-RPC over stdio.
+    ``autostart_migrate`` writes JSON to STDOUT via ``_emit`` when
+    ``as_json=True``, which would corrupt the protocol stream if allowed
+    through. Redirect stdout to a throwaway buffer for the duration of
+    the call (stderr logging is unaffected).
+    """
+    try:
+        from .cli import autostart_migrate
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            autostart_migrate(dry_run=False, as_json=True)
+    except Exception:  # noqa: BLE001 — includes typer.Exit; never propagate.
+        log.exception("mcp bootstrap: autostart migrate attempt failed")
+
+
+def _daemon_covers_repo(repo: Path) -> bool:
+    """Fail-safe check: does the single ``watchd`` daemon's last-reported
+    state claim coverage of *repo*?
+
+    Any failure (missing/corrupt state file, malformed payload) is
+    treated as "not covered" so the in-process watcher fallback stays
+    active rather than silently leaving the repo uncovered.
+    """
+    try:
+        payload = json.loads(watchd_state_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    watched_roots = payload.get("watched_roots")
+    if not isinstance(watched_roots, list):
+        return False
+    return str(Path(repo).resolve()) in watched_roots
+
+
 def _bootstrap_repo() -> Path | None:
     """Locate the active repo and ensure autostart + in-process watcher.
 
@@ -1866,6 +1754,11 @@ def _bootstrap_repo() -> Path | None:
         except Exception:  # noqa: BLE001
             log.exception("mcp bootstrap: autostart registration failed")
 
+        # 1b. opportunistic migrate to the single-daemon (watchd) model.
+        # Separate exception boundary: a failure here must never skip the
+        # registry registration above, and vice versa.
+        _attempt_autostart_migrate()
+
     # 2. one-shot sync to catch up to HEAD
     if not os.environ.get("CODE_MEMORY_NO_BOOT_SYNC"):
         try:
@@ -1880,15 +1773,23 @@ def _bootstrap_repo() -> Path | None:
         except Exception:  # noqa: BLE001
             log.exception("mcp bootstrap: initial sync failed")
 
-    # 3. in-process watcher as belt-and-suspenders (won't double-start
-    #    because OS autostart runs in its own process)
-    if not os.environ.get("CODE_MEMORY_NO_INPROC_WATCHER"):
+    # 3. in-process watcher fallback -- skipped when the single-daemon
+    #    (watchd) autostart model already covers this repo, to avoid
+    #    double-watching / racing debounced syncs.
+    if os.environ.get("CODE_MEMORY_NO_INPROC_WATCHER"):
+        log.info("mcp bootstrap: in-process watcher disabled via env override")
+    elif _daemon_covers_repo(repo):
+        log.info(
+            "mcp bootstrap: daemon confirmed running; skipping in-process "
+            "watcher fallback"
+        )
+    else:
         try:
             from .sync.watcher import Watcher
 
             w = Watcher(repo)
             w.start()
-            log.info("mcp bootstrap: in-process watcher started")
+            log.info("mcp bootstrap: in-process watcher started (fallback)")
             _BOOTSTRAP_REFS["watcher"] = w
         except Exception:  # noqa: BLE001
             log.exception("mcp bootstrap: in-process watcher failed to start")

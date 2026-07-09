@@ -134,7 +134,7 @@ code-memory ingest .
 | **Disk ~3 GB · RAM 8 GB+**   | 16 GB+ recommended for large repos                                    |
 | **OS**                       | macOS / Linux / Windows (WSL2 **or** native PowerShell)               |
 
-Optional: `gemma2:9b` (~5.4 GB) — pull only if you turn on `CLAIMS_EXTRACTION=true` ([see User-claim extraction](#user-claim-extraction-graphiti-style)). Full matrix in [Stack reference](#stack-reference).
+Full matrix in [Stack reference](#stack-reference).
 
 ### 🎛 Advanced install paths
 
@@ -355,12 +355,12 @@ code-memory update --bleeding # install CLI from git+main instead of PyPI
 | --------------------------- | ------------------------------------------------------ | ------------------------------------------------- |
 | **CLI**                     | `sys.prefix` (uv tool / pipx / pip / editable)         | upgrade via the same channel                      |
 | **FalkorDB + Qdrant**       | `~/.code-memory/docker/docker-compose.yml` or running  | `docker compose pull && up -d` (native docker or `wsl -e docker`) |
-| **Ollama models**           | present in `ollama list` (`bge-m3`, `gemma2:9b`, …)    | `ollama pull <model>` (only for already-pulled)   |
+| **Ollama models**           | present in `ollama list` (`bge-m3`, …)                  | `ollama pull <model>` (only for already-pulled)   |
 | **Claude Code plugin**      | `claude plugin list \| grep code-memory`                | `claude plugin install … --force`                 |
 | **OpenCode plugin**         | `npm ls -g code-memory-opencode`                       | `npm i -g code-memory-opencode`                   |
 | **Python extras**           | `FlagEmbedding` / `dnfile` import probe                | covered by the CLI upgrade                        |
 
-Anything you **didn't** install stays untouched. No "do you want gemma?" prompt, no
+Anything you **didn't** install stays untouched. No
 docker churn on a machine that hits remote infra, no plugin re-registration if you
 deliberately removed it.
 
@@ -374,13 +374,43 @@ code-memory updater  (install: uv-tool)
     • Docker: FalkorDB  (running)
     • Docker: Qdrant  (running)
     • Ollama: bge-m3
-    · Ollama: gemma2:9b  [not installed — skip]
     • Claude Code plugin
     • Claude Code MCP
     · OpenCode plugin (npm)  [not installed — skip]
 ```
 
 Use `code-memory update --check` from CI or a cron to nudge devs when a release ships.
+
+---
+
+## Releasing
+
+Releases are tag-driven: pushing an annotated `vX.Y.Z` tag on `main` triggers
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml), which builds
+the `flurryx-code-memory` sdist/wheel and publishes them to PyPI.
+
+1. Bump the version in `pyproject.toml` (`[project].version`) and anywhere
+   else it's duplicated in `src/` (e.g. a `__version__` constant, if present).
+2. Commit the bump:
+   ```bash
+   git commit -am "chore(release): vX.Y.Z"
+   ```
+3. Tag and push:
+   ```bash
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push --tags
+   ```
+4. The `publish` workflow builds the package, verifies the tag matches
+   `pyproject.toml`'s version (mismatches abort the release before anything
+   is uploaded), and publishes to PyPI automatically — no manual `twine
+   upload` needed.
+
+**One-time setup:** PyPI Trusted Publishing must be configured on the
+[`flurryx-code-memory` PyPI project](https://pypi.org/project/flurryx-code-memory/)
+before the first automated release: *Publishing → Add a new publisher*, with
+publisher `GitHub`, repo `fmflurry/code-memory`, workflow `publish.yml`, and
+environment `pypi`. This lets the `publish` job authenticate via OIDC with no
+API token stored in the repo.
 
 ---
 
@@ -983,41 +1013,19 @@ Neo4j and the cloud LLM.
 
 ### How it works
 
-1. The Claude Code / OpenCode **Stop hook** fires at the end of every
-   turn (already in place to record episodes).
-2. It calls the new CLI subcommand `code-memory extract-claims --prompt
-   "..."` in a **detached fire-and-forget process** so the user's session
-   ends immediately.
-3. The CLI spawns a local **Ollama** model (`gemma2:9b` by default) in
-   JSON-mode with a constrained output schema and pulls out claims.
-4. Claims are validated:
-   - `evidence_span` must be a literal substring of the prompt
-     (anti-hallucination guard).
-   - `confidence` below `CLAIMS_MIN_CONFIDENCE` (default `0.6`) is
-     dropped.
-   - Duplicates are deduplicated case-insensitively.
-5. The store applies **contradiction handling**: single-valued
+1. The agent (or plugin) calls the **`codememory_assert_claim`** tool
+   with a `(subject, predicate, object)` triple when it judges a user
+   message claim-worthy.
+2. The tool bypasses any LLM and stores the claim directly — the agent
+   supplies the structured triple itself.
+3. The store applies **contradiction handling**: single-valued
    predicates (`uses`, `prefers`, `deployed-to`, `owns`, …) automatically
    close the prior assertion's `valid_to` when a new conflicting one
    arrives.
-6. Each row carries `valid_at` (when you said it), `valid_to` (NULL
+4. Each row carries `valid_at` (when you said it), `valid_to` (NULL
    while current), `recorded_at` (system clock), and `head_sha` (git
-   HEAD at extraction time) — so you can ask "what did the user say
-   about X **as of commit Y**?".
-
-### Enabling it
-
-```bash
-# one-time: pull the model (~5.4 GB)
-ollama pull gemma2:9b
-# or: ./scripts/install.sh --with-claims
-
-# turn it on
-export CLAIMS_EXTRACTION=true
-```
-
-You can override the model with `CLAIMS_LLM_MODEL` (any chat-capable
-Ollama model that honors `format: <json-schema>`).
+    HEAD at claim time) — so you can ask "what did the user say about X
+    **as of commit Y**?".
 
 ### Entity resolution
 
@@ -1078,21 +1086,14 @@ sqlite3 ./data/<slug>/claims.db \
 
 ### Costs
 
-- **Disk**: ~5.4 GB for `gemma2:9b`. The model is shared across all
-  projects on the host.
-- **Latency**: ~1.5–3 s per prompt on Apple Silicon. Runs in a detached
-  process post-turn, so this never adds to a session's wall-clock.
-- **Privacy**: prompts never leave the host — Ollama is local, claims are
-  stored in per-project SQLite under `./data/<slug>/claims.db`.
+- **Disk**: negligible — claims are text stored in per-project SQLite.
+- **Privacy**: prompts never leave the host; claims are stored in
+  per-project SQLite under `./data/<slug>/claims.db`.
 
 ### When to skip it
 
 - You don't share much factual context in prose (everything is in code
   comments / commit messages already).
-- You're on a CPU-only host where 9B inference is too slow.
-- You prefer a smaller, faster model — set
-  `CLAIMS_LLM_MODEL=qwen2.5:7b-instruct` or `llama3.2:3b`. Quality drops
-  on negation / hypotheticals, but extraction is 2-4x faster.
 
 ---
 
@@ -1142,7 +1143,6 @@ Run on any engine — docker-ce in WSL2, Colima, docker-ce, or Docker Desktop ([
 | Model          | Pull command            | Size    | Required?                                        |
 | -------------- | ----------------------- | ------- | ------------------------------------------------ |
 | `bge-m3`       | `ollama pull bge-m3`    | ~1.2 GB | Yes — default embedding model                    |
-| `gemma2:9b`    | `ollama pull gemma2:9b` | ~5.4 GB | Optional — only with `CLAIMS_EXTRACTION=true`    |
 
 ### Harness plugins
 
@@ -1155,12 +1155,11 @@ Run on any engine — docker-ce in WSL2, Colima, docker-ce, or Docker Desktop ([
 
 | Component           | Minimum version                | Notes                                                              |
 | ------------------- | ------------------------------ | ------------------------------------------------------------------ |
-| **Python**          | 3.11                           | Orchestrator + CLI + extractor                                     |
+| **Python**          | 3.11                           | Orchestrator + CLI                                                 |
 | **Docker**          | 20.x (Compose v2)              | FalkorDB + Qdrant locally                                          |
 | **Ollama**          | latest                         | Default embedding daemon (keeps `bge-m3` warm)                     |
 | **Embedding model** | `bge-m3`                       | `ollama pull bge-m3` (~1.2 GB). Default; recall champion. Opt-in alternates: `EMBED_BACKEND=flagembed` (in-process dense+sparse, ~2.3 GB) or `EMBED_BACKEND=tei` (Linux + NVIDIA, 5-10× cold ingest, same weights). |
-| **Claims model**    | `gemma2:9b` *(optional)*       | `ollama pull gemma2:9b` (~5.4 GB). Only with `CLAIMS_EXTRACTION=true`. |
-| **Disk**            | ~3 GB                          | Ollama model + Docker volumes + Python deps. Add ~5.4 GB for claims. |
+| **Disk**            | ~3 GB                          | Ollama model + Docker volumes + Python deps. |
 | **RAM**             | 8 GB+                          | 16 GB+ for large repos                                             |
 | **OS**              | macOS / Linux / Windows (WSL2) | Tested on Apple Silicon + Linux x86_64                             |
 
