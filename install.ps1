@@ -190,21 +190,47 @@ function Invoke-Docker {
 function Install-WslKeepalive {
   if ($script:KeepaliveOffered) { return }
   $script:KeepaliveOffered = $true
-  $vbs = Join-Path ([Environment]::GetFolderPath('Startup')) 'code-memory-wsl-docker.vbs'
-  if (Test-Path $vbs) { Ok "WSL keepalive already installed"; return }
+  $taskName = 'code-memory-wsl-docker'
+  $startupVbs = Join-Path ([Environment]::GetFolderPath('Startup')) 'code-memory-wsl-docker.vbs'
+  if ((Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) -or (Test-Path $startupVbs)) {
+    Ok "WSL keepalive already installed"; return
+  }
   if (-not (Ask-YesNo "Auto-start a hidden WSL keepalive at logon so dockerd stays up?" "Y")) {
     Warn "without it, WSL idle-shutdown stops dockerd (and the containers) between sessions"
     return
   }
-  @(
+  $vbsBody = @(
     "' code-memory: keep the WSL VM (and dockerd) alive in the background."
     "' WSL2 shuts the VM down ~1 min after the last session detaches, taking"
-    "' the FalkorDB/Qdrant containers with it. Remove this file to disable."
+    "' the FalkorDB/Qdrant containers with it."
     'CreateObject("Wscript.Shell").Run "wsl.exe -e sleep infinity", 0, False'
-  ) | Set-Content -Path $vbs -Encoding ASCII
-  Ok "keepalive installed: $vbs"
-  Dim "remove later by deleting that file"
-  # Cover the current session too — the Startup entry only fires at next logon.
+  )
+  # Prefer a real logon task: Startup-folder entries ride the Startup-apps
+  # stagger and can fire many minutes into a heavy (EDR-scanned) corporate
+  # logon, leaving hooks/MCP with connection-refused meanwhile. schtasks.exe
+  # /SC ONLOGON is commonly GPO-denied unelevated, but the Task Scheduler
+  # COM API behind Register-ScheduledTask usually is not.
+  $vbs = Join-Path $env:LOCALAPPDATA 'code-memory\wsl-keepalive.vbs'
+  New-Item -ItemType Directory -Path (Split-Path $vbs) -Force | Out-Null
+  $vbsBody | Set-Content -Path $vbs -Encoding ASCII
+  try {
+    $a = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('"' + $vbs + '"')
+    $t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+      -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $taskName -Action $a -Trigger $t -Settings $s `
+      -Force -ErrorAction Stop | Out-Null
+    Ok "keepalive installed: scheduled task '$taskName' (fires seconds after logon)"
+    Dim "remove later with:  Unregister-ScheduledTask -TaskName '$taskName'"
+  } catch {
+    # Task Scheduler locked down too — fall back to the Startup folder
+    # (never needs elevation, just slower to fire during a busy logon).
+    Remove-Item $vbs -ErrorAction SilentlyContinue
+    $vbsBody | Set-Content -Path $startupVbs -Encoding ASCII
+    Ok "keepalive installed: $startupVbs"
+    Dim "remove later by deleting that file"
+  }
+  # Cover the current session too — logon triggers only fire at next logon.
   Start-Process -FilePath 'wsl.exe' -ArgumentList '-e','sleep','infinity' -WindowStyle Hidden
 }
 
