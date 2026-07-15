@@ -35,6 +35,7 @@ import httpx
 
 from . import __version__ as _LOCAL_VERSION
 from ._docker import _is_windows, docker_argv, docker_path_exists, resolve_docker, to_docker_path
+from ._volumes import offer_volume_migration
 
 PYPI_PACKAGE = "flurryx-code-memory"
 LEGACY_PACKAGE = "code-memory"  # historical dist name still in older uv-tool venvs
@@ -544,6 +545,7 @@ def run_update(
     full: bool,
     bleeding: bool,
     extras_override: str | None = None,
+    migrate_volumes: bool = False,
 ) -> int:
     """Top-level entry point used by the CLI.
 
@@ -569,6 +571,11 @@ def run_update(
     changed, detail = migrate_env_localhost()
     if changed:
         print(f"  Config: {detail}")
+
+    # Engine-switch aftercare (Windows): the index lives in docker volumes
+    # and does not follow a Docker Desktop → WSL docker-ce move. Detects the
+    # situation and asks once — migrate the volumes / re-ingest / skip.
+    rc |= offer_volume_migration(force=migrate_volumes)
 
     if behind_cli:
         ok, detail = upgrade_cli(plan.install_method, bleeding=bleeding)
